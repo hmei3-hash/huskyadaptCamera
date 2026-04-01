@@ -18,3 +18,5 @@ Extend system to generate large-scale point cloud data
 Goal
 
 The ultimate goal is to develop a hybrid proximity sensing system that combines vision and ultrasonic sensing to achieve higher reliability and accuracy compared to single-sensor approaches.
+
+Check the image and mp4 file to see features
