@@ -1,0 +1,2 @@
+# Model weights are git-ignored.
+# Run `python vision/detection/export_model.py` to generate yolov8n.onnx here.

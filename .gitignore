@@ -1,0 +1,43 @@
+# ─── Model weights (download or export locally) ───
+*.onnx
+*.pt
+*.pth
+*.engine
+*.tflite
+
+# ─── Media assets (keep in docs/ or use Git LFS) ───
+*.mp4
+*.avi
+*.mov
+*.JPG
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+
+# ─── IDE / Editor ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+
+# ─── Torch Hub cache ───
+.cache/
