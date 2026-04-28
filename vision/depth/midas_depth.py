@@ -52,7 +52,10 @@ def calibrate(model, transform, frame, device, input_size, ref_x, ref_y, ref_dis
     r = 15
     region = depth[cy - r : cy + r, cx - r : cx + r]
     raw_val = np.mean(region)
-    scale = ref_dist / max(raw_val, 1e-6)
+    # MiDaS outputs inverse depth: higher raw = closer object.
+    # scale = ref_dist * raw_center, so that real_depth = scale / raw
+    # gives ref_dist at the calibration point.
+    scale = ref_dist * max(raw_val, 1e-6)
     print(f"[Calibration] scale={scale:.6f}  raw_center={raw_val:.2f}")
     return scale
 
@@ -110,7 +113,7 @@ def main():
 
         t0 = time.time()
         depth = infer_depth(model, transform, frame, device, args.input_size)
-        real_depth_map = depth * scale
+        real_depth_map = scale / np.clip(depth, 1e-3, None)
 
         # Colormap
         d_min, d_max = depth.min(), depth.max()

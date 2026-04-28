@@ -148,7 +148,7 @@ def main():
 
         t0 = time.time()
         depth = infer_depth(model, transform, frame, device, args.input_size)
-        real_depth_map = depth * scale
+        real_depth_map = scale / np.clip(depth, 1e-3, None)
 
         # Left panel: RGB + grid
         left = draw_grid_overlay(frame, real_depth_map, rows, cols)
