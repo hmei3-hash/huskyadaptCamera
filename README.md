@@ -146,6 +146,10 @@ The `combined_pipeline.py` is the main entry point with these optimizations:
 - **Sensors:** HC-SR04 ultrasonic, DHT22/DS18B20 (temperature), SHT31 (humidity)
 - **Platform:** Clearpath Husky UGV
 
+
+
+##todo
+加上时间窗口，长时间站着不动，然后就停止震动
 ## License
 
 MIT
