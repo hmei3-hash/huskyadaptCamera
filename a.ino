@@ -1,226 +1,388 @@
-#define TRIG_PIN        18
-#define ECHO_PIN        5
-#define TRIGGER_PIN     23
-#define BUTTON_PIN      19
+// Ultrasonic presence detector for ESP32 Arduino.
+//
+// Design goals:
+// - Measure distance without blocking the main loop.
+// - Smooth noisy ultrasonic readings with a small median filter.
+// - Trigger once when someone enters, then stay quiet until they fully leave.
+// - Keep the code simple enough to debug from the Serial Monitor.
 
-#define MAX_DISTANCE_CM   400
-#define THRESHOLD_CM      100
-#define PULSE_MS          1000      // 1 second trigger pulse
-#define SOUND_SPEED_CM_US 0.0343f
+// === Pins ===
+#define TRIG_PIN        18          // Ultrasonic sensor trigger pin
+#define ECHO_PIN        5           // Ultrasonic sensor echo pin
+#define TRIGGER_PIN     23          // Output pin to the external trigger device
+#define BUTTON_PIN      19          // Mode button, wired to ground with INPUT_PULLUP
 
-// === Consensus ===
-#define HISTORY_SIZE      20
-#define SIMILARITY_CM     10
-#define MIN_AGREEMENT     2
-
-// === State confirmation (use a few readings to confirm in/out state, noise-resistant) ===
-#define STATE_CONFIRM_N   3         // Require N consecutive readings to change inside/outside state
-#define HYSTERESIS_CM     10        // Hysteresis band to prevent flickering at the threshold edge
+// === Distance behavior ===
+#define MAX_DISTANCE_CM   400       // Ignore anything farther than this
+#define THRESHOLD_CM      100       // "Occupied" begins closer than this distance
+#define HYSTERESIS_CM     10        // Must clear past threshold + this amount to re-arm
 
 // === Timing ===
-#define PING_INTERVAL_MS  40
-#define ECHO_TIMEOUT_US   25000
-#define DEBUG_PRINT_MS    200
-#define DEBOUNCE_MS       50
+#define PULSE_MS          1000      // Output trigger pulse length in queue/line modes
+#define PING_INTERVAL_MS  40        // Time between ultrasonic pings
+#define ECHO_TIMEOUT_US   25000     // Max echo wait before treating reading as no object
+#define DEBOUNCE_MS       50        // Button debounce time
+#define DEBUG_PRINT_MS    200       // Serial debug print interval
+
+// === Sensor math ===
+#define SOUND_SPEED_CM_US 0.0343f   // Speed of sound in cm per microsecond
+
+// === Filtering and state ===
+#define FILTER_SIZE       5         // Median filter sample count
+#define CLEAR_READINGS    3         // Queue mode readings required before re-arming
+#define LINE_CLEAR_EXTRA  2         // Line mode adds extra clear readings before re-arming
 
 // === Modes ===
-enum Mode { MODE_QUEUE, MODE_STRICT, MODE_COUNT };
-volatile uint8_t currentMode = MODE_QUEUE;
+// QUEUE:
+//   Trigger once when something enters the zone. Do not retrigger until clear.
+//
+// STRICT:
+//   Keep the trigger output high while something is inside the zone.
+//
+// LINE:
+//   Like queue mode, but requires more clear readings before re-arming.
+//   This is more tolerant of slow or uneven movement.
+enum Mode {
+  MODE_QUEUE,
+  MODE_STRICT,
+  MODE_LINE,
+  MODE_COUNT
+};
 
-// === ISR shared state ===
-volatile unsigned long echoStartUs = 0;
-volatile unsigned long echoEndUs = 0;
-volatile bool echoDone = false;
+// === Interrupt-shared echo state ===
+// These are written by the interrupt and read by loop code, so they must be volatile.
+volatile unsigned long echoRiseUs = 0;
+volatile unsigned long echoPulseUs = 0;
+volatile bool echoComplete = false;
 
-// === Buffer & timing ===
-unsigned long history[HISTORY_SIZE];
-uint8_t historyIndex = 0;
-bool historyFull = false;
+// === Current mode ===
+Mode currentMode = MODE_QUEUE;
 
+// === Ping state ===
+// These let the sketch start a ping, keep looping, and later handle the echo.
 unsigned long lastPingMs = 0;
 unsigned long pingStartUs = 0;
 bool waitingForEcho = false;
 
-unsigned long triggerHighUntilMs = 0;
-bool pinIsHigh = false;
+// === Distance readings ===
+unsigned long rawDistanceCm = MAX_DISTANCE_CM;
+unsigned long filteredDistanceCm = MAX_DISTANCE_CM;
+bool newDistanceAvailable = false;
 
-unsigned long lastPrintMs = 0;
-unsigned long lastDist = 0;
-uint8_t lastAgreement = 0;
+// === Median filter buffer ===
+unsigned long filterBuffer[FILTER_SIZE];
+uint8_t filterIndex = 0;
+uint8_t filterCount = 0;
 
-// === Inside/outside state ===
-bool wasInside = false;             // Whether currently within the threshold
-uint8_t insideCount = 0;            // Consecutive readings judged as inside
-uint8_t outsideCount = 0;           // Consecutive readings judged as outside
+// === Presence state ===
+// occupied means the area is currently armed/claimed by a person or object.
+// clearCount prevents one noisy far reading from re-arming the detector.
+bool occupied = false;
+uint8_t clearCount = 0;
 
-// === Button state ===
-bool lastButtonState = HIGH;
+// === Trigger output state ===
+bool triggerActive = false;
+unsigned long triggerStartMs = 0;
+
+// === Button debounce state ===
 bool buttonStableState = HIGH;
-unsigned long lastDebounceMs = 0;
+bool lastButtonReading = HIGH;
+unsigned long lastButtonChangeMs = 0;
+
+// === Debug timing ===
+unsigned long lastDebugMs = 0;
+
+// Function prototypes make this compatible with Arduino IDE's simple build flow.
+void checkButton();
+void advanceMode();
+void updateSensor();
+void startPing();
+unsigned long pulseToDistanceCm(unsigned long pulseUs);
+unsigned long getMedianDistance(unsigned long distanceCm);
+void sortSmallArray(unsigned long values[], uint8_t count);
+void updatePresence(unsigned long distanceCm);
+uint8_t getRequiredClearReadings();
+void updateTrigger();
+void startTrigger();
+void stopTrigger();
+void printDebug();
+const char *getModeName(Mode mode);
 
 void IRAM_ATTR echoISR() {
+  // Rising edge: echo pulse has started.
   if (digitalRead(ECHO_PIN) == HIGH) {
-    echoStartUs = micros();         // Rising edge: echo pulse started
+    echoRiseUs = micros();
   } else {
-    echoEndUs = micros();           // Falling edge: echo pulse ended
-    echoDone = true;
+    // Falling edge: echo pulse has ended.
+    echoPulseUs = micros() - echoRiseUs;
+    echoComplete = true;
   }
 }
 
-uint8_t countSimilar(unsigned long currentDist) {
-  uint8_t count = 0;
-  uint8_t total = historyFull ? HISTORY_SIZE : historyIndex;
-  for (uint8_t i = 0; i < total; i++) {
-    if (history[i] == 0) continue;
-    long diff = (long)history[i] - (long)currentDist;
-    if (diff < 0) diff = -diff;
-    if (diff <= SIMILARITY_CM) count++;
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(TRIGGER_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  digitalWrite(TRIG_PIN, LOW);
+  digitalWrite(TRIGGER_PIN, LOW);
+
+  // Start the filter with "far away" values so startup does not false-trigger.
+  for (uint8_t i = 0; i < FILTER_SIZE; i++) {
+    filterBuffer[i] = MAX_DISTANCE_CM;
   }
-  return count;
+
+  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echoISR, CHANGE);
+
+  Serial.println("Presence detector ready");
+  Serial.println("Mode: QUEUE");
 }
 
-void triggerPing() {
-  // Send a 10us pulse on TRIG
+void loop() {
+  checkButton();
+  updateSensor();
+
+  // Only update the presence state when a fresh distance reading is ready.
+  if (newDistanceAvailable) {
+    newDistanceAvailable = false;
+    filteredDistanceCm = getMedianDistance(rawDistanceCm);
+    updatePresence(filteredDistanceCm);
+  }
+
+  updateTrigger();
+  printDebug();
+}
+
+void checkButton() {
+  bool reading = digitalRead(BUTTON_PIN);
+  unsigned long now = millis();
+
+  // Any change restarts the debounce timer.
+  if (reading != lastButtonReading) {
+    lastButtonChangeMs = now;
+    lastButtonReading = reading;
+  }
+
+  // Accept the new button state only after it has stayed stable.
+  if ((now - lastButtonChangeMs) >= DEBOUNCE_MS && reading != buttonStableState) {
+    buttonStableState = reading;
+
+    // INPUT_PULLUP means LOW is pressed.
+    if (buttonStableState == LOW) {
+      advanceMode();
+    }
+  }
+}
+
+void advanceMode() {
+  currentMode = (Mode)((currentMode + 1) % MODE_COUNT);
+
+  // Reset state when switching modes so the new mode starts cleanly.
+  occupied = false;
+  clearCount = 0;
+  stopTrigger();
+
+  Serial.print("Mode: ");
+  Serial.println(getModeName(currentMode));
+}
+
+void updateSensor() {
+  unsigned long nowMs = millis();
+  unsigned long nowUs = micros();
+
+  // Start a new ping at a fixed interval, as long as the previous ping is done.
+  if (!waitingForEcho && (nowMs - lastPingMs) >= PING_INTERVAL_MS) {
+    noInterrupts();
+    echoComplete = false;
+    interrupts();
+
+    startPing();
+    lastPingMs = nowMs;
+    pingStartUs = nowUs;
+    waitingForEcho = true;
+  }
+
+  // If the interrupt captured a complete echo pulse, convert it to distance.
+  if (waitingForEcho && echoComplete) {
+    noInterrupts();
+    unsigned long pulseUs = echoPulseUs;
+    echoComplete = false;
+    interrupts();
+
+    waitingForEcho = false;
+    rawDistanceCm = pulseToDistanceCm(pulseUs);
+    newDistanceAvailable = true;
+  }
+
+  // If no echo arrives in time, treat it as "far away."
+  if (waitingForEcho && (micros() - pingStartUs) > ECHO_TIMEOUT_US) {
+    noInterrupts();
+    echoComplete = false;
+    interrupts();
+
+    waitingForEcho = false;
+    rawDistanceCm = MAX_DISTANCE_CM;
+    newDistanceAvailable = true;
+  }
+}
+
+void startPing() {
+  // HC-SR04-style sensors want a short 10 microsecond trigger pulse.
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
-  echoDone = false;
-  pingStartUs = micros();
-  waitingForEcho = true;
 }
 
-void fireTrigger() {
-  digitalWrite(TRIGGER_PIN, HIGH);
-  pinIsHigh = true;
-  triggerHighUntilMs = millis() + PULSE_MS;
+unsigned long pulseToDistanceCm(unsigned long pulseUs) {
+  // The sound travels to the object and back, so divide by 2.
+  unsigned long distance = (unsigned long)((pulseUs * SOUND_SPEED_CM_US) / 2.0f);
+
+  if (distance == 0 || distance > MAX_DISTANCE_CM) {
+    return MAX_DISTANCE_CM;
+  }
+
+  return distance;
 }
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(TRIGGER_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  digitalWrite(TRIG_PIN, LOW);
-  digitalWrite(TRIGGER_PIN, LOW);
-  for (uint8_t i = 0; i < HISTORY_SIZE; i++) history[i] = 0;
-  attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echoISR, CHANGE);
-  lastPingMs = millis();
-  Serial.println("Ready - Mode: QUEUE");
+unsigned long getMedianDistance(unsigned long distanceCm) {
+  filterBuffer[filterIndex] = distanceCm;
+  filterIndex = (filterIndex + 1) % FILTER_SIZE;
+
+  if (filterCount < FILTER_SIZE) {
+    filterCount++;
+  }
+
+  // Copy the active samples, sort the copy, and return the middle value.
+  unsigned long sorted[FILTER_SIZE];
+
+  for (uint8_t i = 0; i < filterCount; i++) {
+    sorted[i] = filterBuffer[i];
+  }
+
+  sortSmallArray(sorted, filterCount);
+  return sorted[filterCount / 2];
 }
 
-void processReading(unsigned long dist) {
-  history[historyIndex] = dist;
-  historyIndex = (historyIndex + 1) % HISTORY_SIZE;
-  if (historyIndex == 0) historyFull = true;
-
-  lastDist = dist;
-  lastAgreement = (dist != 0) ? countSimilar(dist) : 0;
-
-  // Invalid reading: don't change state (person may have left)
-  if (dist == 0) {
-    return;
-  }
-
-  // Judge inside/outside using hysteresis:
-  // entering requires < THRESHOLD, leaving requires > THRESHOLD + hysteresis,
-  // which avoids flickering at the edge
-  bool readingInside  = (dist < THRESHOLD_CM);
-  bool readingOutside = (dist > THRESHOLD_CM + HYSTERESIS_CM);
-
-  // Reading only counts toward state if consensus is high enough
-  bool reliable = (lastAgreement >= MIN_AGREEMENT);
-
-  if (readingInside && reliable) {
-    insideCount++;
-    outsideCount = 0;
-    // Confirmed entry, and previously outside -> crossing edge, fire trigger
-    if (insideCount >= STATE_CONFIRM_N && !wasInside) {
-      wasInside = true;
-      fireTrigger();          // Fire only on the outside->inside transition
-    }
-  } else if (readingOutside) {
-    outsideCount++;
-    insideCount = 0;
-    // Confirmed exit -> reset state so the next entry can trigger again
-    if (outsideCount >= STATE_CONFIRM_N && wasInside) {
-      wasInside = false;
-    }
-  }
-  // Between THRESHOLD and THRESHOLD+HYSTERESIS: hold current state (hysteresis band)
-
-  // STRICT mode: overrides the above; fires every time while inside if consensus is high enough
-  if (currentMode == MODE_STRICT && readingInside && reliable) {
-    fireTrigger();
-  }
-}
-
-void checkButton() {
-  bool reading = digitalRead(BUTTON_PIN);
-  if (reading != lastButtonState) {
-    lastDebounceMs = millis();   // State changed, reset debounce timer
-  }
-  if ((millis() - lastDebounceMs) > DEBOUNCE_MS) {
-    if (reading != buttonStableState) {
-      buttonStableState = reading;
-      // On press (HIGH->LOW because of PULLUP), switch mode
-      if (buttonStableState == LOW) {
-        currentMode = (currentMode + 1) % MODE_COUNT;
-        wasInside = false;       // Reset state when switching mode
-        insideCount = 0;
-        outsideCount = 0;
-        Serial.print("Mode switched to: ");
-        Serial.println(currentMode == MODE_QUEUE ? "QUEUE" : "STRICT");
+void sortSmallArray(unsigned long values[], uint8_t count) {
+  // Tiny manual sort. This avoids STL and keeps the sketch Arduino-friendly.
+  for (uint8_t i = 0; i < count; i++) {
+    for (uint8_t j = i + 1; j < count; j++) {
+      if (values[j] < values[i]) {
+        unsigned long temp = values[i];
+        values[i] = values[j];
+        values[j] = temp;
       }
     }
   }
-  lastButtonState = reading;
 }
 
-void loop() {
+void updatePresence(unsigned long distanceCm) {
+  bool insideZone = distanceCm < THRESHOLD_CM;
+  bool fullyClear = distanceCm > (THRESHOLD_CM + HYSTERESIS_CM);
+
+  if (currentMode == MODE_STRICT) {
+    // Strict mode acts like a live presence output with hysteresis.
+    if (!occupied && insideZone) {
+      occupied = true;
+    } else if (occupied && fullyClear) {
+      occupied = false;
+    }
+
+    return;
+  }
+
+  // Queue/line modes trigger once on entry.
+  if (!occupied && insideZone) {
+    occupied = true;
+    clearCount = 0;
+    startTrigger();
+    return;
+  }
+
+  // Once occupied, require several fully-clear readings before re-arming.
+  if (occupied && fullyClear) {
+    clearCount++;
+
+    if (clearCount >= getRequiredClearReadings()) {
+      occupied = false;
+      clearCount = 0;
+    }
+  } else if (occupied && insideZone) {
+    // If the person/object is clearly still inside, cancel the clear attempt.
+    clearCount = 0;
+  }
+}
+
+uint8_t getRequiredClearReadings() {
+  if (currentMode == MODE_LINE) {
+    return CLEAR_READINGS + LINE_CLEAR_EXTRA;
+  }
+
+  return CLEAR_READINGS;
+}
+
+void updateTrigger() {
+  if (currentMode == MODE_STRICT) {
+    // In strict mode, the output mirrors the occupied state.
+    digitalWrite(TRIGGER_PIN, occupied ? HIGH : LOW);
+    triggerActive = occupied;
+    return;
+  }
+
+  // In queue/line modes, turn off the pulse after PULSE_MS.
+  if (triggerActive && (millis() - triggerStartMs) >= PULSE_MS) {
+    stopTrigger();
+  }
+}
+
+void startTrigger() {
+  digitalWrite(TRIGGER_PIN, HIGH);
+  triggerActive = true;
+  triggerStartMs = millis();
+}
+
+void stopTrigger() {
+  digitalWrite(TRIGGER_PIN, LOW);
+  triggerActive = false;
+}
+
+void printDebug() {
   unsigned long now = millis();
 
-  checkButton();
-
-  // Task 1: kick off a new ping every PING_INTERVAL_MS
-  if (!waitingForEcho && (now - lastPingMs >= PING_INTERVAL_MS)) {
-    lastPingMs = now;
-    triggerPing();
+  if ((now - lastDebugMs) < DEBUG_PRINT_MS) {
+    return;
   }
 
-  // Task 2: handle finished echo
-  if (waitingForEcho && echoDone) {
-    waitingForEcho = false;
-    unsigned long duration = echoEndUs - echoStartUs;
-    unsigned long dist = (unsigned long)((duration * SOUND_SPEED_CM_US) / 2.0f);
-    if (dist < 2 || dist > MAX_DISTANCE_CM) dist = 0;   // mark invalid
-    processReading(dist);
-  }
+  lastDebugMs = now;
 
-  // Task 3: timeout check (no echo received)
-  if (waitingForEcho && (micros() - pingStartUs > ECHO_TIMEOUT_US)) {
-    waitingForEcho = false;
-    processReading(0);   // 0 = no reading
-  }
+  Serial.print("mode=");
+  Serial.print(getModeName(currentMode));
+  Serial.print(" raw=");
+  Serial.print(rawDistanceCm);
+  Serial.print("cm filtered=");
+  Serial.print(filteredDistanceCm);
+  Serial.print("cm occupied=");
+  Serial.print(occupied ? "yes" : "no");
+  Serial.print(" clearCount=");
+  Serial.print(clearCount);
+  Serial.print(" trigger=");
+  Serial.println(triggerActive ? "on" : "off");
+}
 
-  // Task 4: non-blocking pulse drop
-  if (pinIsHigh && (long)(now - triggerHighUntilMs) >= 0) {
-    digitalWrite(TRIGGER_PIN, LOW);
-    pinIsHigh = false;
-  }
-
-  // Task 5: debug print (rate-limited to avoid blocking the main loop)
-  if (now - lastPrintMs >= DEBUG_PRINT_MS) {
-    lastPrintMs = now;
-    Serial.print(currentMode == MODE_QUEUE ? "[Q] " : "[S] ");
-    Serial.print("dist=");
-    Serial.print(lastDist);
-    Serial.print("cm inside=");
-    Serial.print(wasInside ? "Y" : "N");
-    Serial.print(" agree=");
-    Serial.print(lastAgreement);
-    Serial.println();
+const char *getModeName(Mode mode) {
+  switch (mode) {
+    case MODE_QUEUE:
+      return "QUEUE";
+    case MODE_STRICT:
+      return "STRICT";
+    case MODE_LINE:
+      return "LINE";
+    default:
+      return "UNKNOWN";
   }
 }
