@@ -153,6 +153,9 @@ The `combined_pipeline.py` is the main entry point with these optimizations:
 - **Platform:** Clearpath Husky walker
 - **Output:** Vibration motor or buzzer connected to trigger pin
 
+## User testing and data visualization
+![Demo](plots.pdf)
+
 ## License
 
 MIT
