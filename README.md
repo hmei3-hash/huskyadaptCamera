@@ -2,7 +2,7 @@
 
 Branch: `performance_testing_and_improvement`
 
-Latency and performance benchmarking for the HuskyAdapt proximity sensor. Compares a stripped-down baseline (threshold only) against the full IMU fusion algorithm (consensus + hysteresis + state confirmation + IMU auto mode switching) to quantify the cost of each algorithm layer.
+Latency, false-positive, and architecture benchmarking for the HuskyAdapt proximity sensor. Compares three firmware variants to quantify the cost and benefit of each algorithm layer, including an RTOS experiment that proved the bottleneck is physics, not software.
 
 ## Hardware Setup
 
@@ -20,124 +20,127 @@ Board: ESP32
 
 ```
 performance_testing_and_improvement/
-├── a_baseline_latency.ino      # Baseline firmware — threshold only, no algorithms
-├── a_full_imu_latency.ino      # Full firmware — consensus, hysteresis, state confirm, IMU
-├── latency_test.py             # Python serial data collector + stats + comparison
-├── latency_baseline.csv        # Collected baseline data (15 samples)
-├── latency_full.csv            # Collected full version data (15 samples)
-├── latency_comparison.txt      # Markdown comparison table
-├── ANALYSIS.md                 # Detailed results analysis and findings
+│
+├── Latency Testing
+│   ├── a_baseline_latency.ino          # Baseline — threshold only, no algorithms
+│   ├── a_full_imu_latency.ino          # Full — consensus + hysteresis + state confirm + IMU
+│   ├── a_step1_task_notification.ino   # Full + FreeRTOS task notification (RTOS experiment)
+│   ├── latency_test.py                 # Python serial collector + stats + comparison
+│   ├── latency_baseline.csv            # Baseline data (15 samples)
+│   ├── latency_full.csv                # Full polling data (15 samples)
+│   ├── latency_rtos.csv                # Full RTOS data (15 samples)
+│   └── latency_comparison.txt          # Baseline vs Full comparison table
+│
+├── False Positive Testing
+│   ├── a_fp_test_baseline.ino          # Baseline — 3-min auto-counting test
+│   └── a_fp_test_full.ino              # Full — 3-min auto-counting test with consensus stats
+│
+├── ANALYSIS.md                         # Detailed results and findings
 └── README.md
 ```
 
-## What Each Firmware Does
+## Three Firmware Variants
 
-**Baseline (`a_baseline_latency.ino`)**
+### Baseline (`a_baseline_latency.ino`)
+Simplest possible detection. If `distance < 100cm` and was previously outside, fire trigger immediately. No consensus, no history, no hysteresis, no state confirmation, no IMU. One reading triggers.
 
-Simplest possible detection: if `distance < 100cm` and was previously outside, fire trigger immediately. No consensus, no history buffer, no hysteresis, no state confirmation, no IMU. One reading is enough to trigger.
+### Full Polling (`a_full_imu_latency.ino`)
+All algorithm layers enabled in a traditional Arduino `loop()`:
+- 20-reading history buffer with consensus filter (MIN_AGREEMENT = 2)
+- 10 cm hysteresis band to prevent edge flickering
+- State confirmation requiring 3 consecutive readings
+- MPU6050 accelerometer variance for auto WALKING/QUEUING mode switching
+- Mode-dependent re-arm bands (110 cm walking, 150 cm queuing)
 
-**Full (`a_full_imu_latency.ino`)**
+### Full RTOS (`a_step1_task_notification.ino`)
+Same algorithms as Full Polling, but restructured with FreeRTOS:
+- `echoISR()` sends a Task Notification instead of setting a flag
+- `ultrasonicTask` (priority 3) blocks until notified, preempts `loop()`
+- `loop()` (priority 1) only handles IMU, pulse drop, and serial print
+- Hypothesis: reducing polling jitter would improve E2E latency
 
-All algorithm layers enabled:
-- 20-reading history buffer with consensus filter (requires 2+ similar readings)
-- 10cm hysteresis band to prevent edge flickering
-- State confirmation requiring 3 consecutive readings before committing
-- MPU6050 accelerometer variance for automatic WALKING/QUEUING mode switching
-- Mode-dependent re-arm bands (110cm walking, 150cm queuing)
+## Results
 
-Both firmwares print `[LATENCY]` lines on each trigger event with microsecond timestamps.
+### Latency Comparison (15 samples each)
 
-## Prerequisites
+| Metric | Baseline | Full (Polling) | Full (RTOS) |
+|--------|----------|----------------|-------------|
+| Proc latency (median) | 4 µs | 5 µs | 6 µs |
+| Proc latency (mean) | 3.7 µs | 5.4 µs | 6.5 µs |
+| E2E latency (median) | 5,932 µs | 7,516 µs | 6,814 µs |
+| E2E latency (mean) | 5,120 µs | 7,495 µs | 6,799 µs |
+| Avg trigger distance | 49.0 cm | 89.9 cm | 77.9 cm |
+| Mode at trigger | — | WALKING | QUEUING |
+| CPU usage per cycle | 0.009% | 0.014% | 0.016% |
+
+### Distance-Normalized Analysis
+
+E2E latency is dominated by the speed of sound. Trigger distances varied across tests, so raw E2E numbers are not directly comparable. After normalizing:
+
+| Comparison | Distance Gap | Expected Sound Δ | Actual E2E Δ | Software Overhead |
+|------------|-------------|-------------------|--------------|-------------------|
+| Baseline vs Full (Polling) | 40.9 cm | 2,387 µs | 2,375 µs | ≈ 0 µs |
+| Full (Polling) vs Full (RTOS) | 12.0 cm | 698 µs | 696 µs | ≈ 0 µs |
+
+In both cases, after accounting for sound travel distance, the software overhead is effectively **zero**.
+
+### True User-Perceived Delay
+
+| Version | Formula | Typical Delay |
+|---------|---------|---------------|
+| Baseline | 1 ping cycle + E2E | ~46 ms |
+| Full | 3 ping cycles + E2E | ~128 ms |
+| Full (RTOS) | 3 ping cycles + E2E | ~128 ms |
+
+The 82 ms difference between baseline and full comes entirely from `STATE_CONFIRM_N = 3` requiring two extra 40 ms ping cycles. RTOS does not reduce this.
+
+## Key Findings
+
+### 1. Algorithmic CPU cost is negligible
+Consensus (20-element loop) + hysteresis + state confirmation + IMU variance together add only 1.7 µs. The ESP32 is idle >99.98% of the time.
+
+### 2. E2E differences are physics, not software
+After normalizing for trigger distance, the software overhead between all three versions is within measurement noise (≈ 0 µs). The speed of sound dominates.
+
+### 3. RTOS does not help this project
+The RTOS experiment added 1 µs of task-switching overhead to proc latency and provided zero improvement to E2E. The bottleneck is the speed of sound and the intentional state confirmation delay, neither of which RTOS can address. This is a valid finding: **correct performance analysis means knowing when not to optimize.**
+
+### 4. The real cost is a design choice
+The full version's ~82 ms extra perceived delay is intentional — it waits for 3 consecutive confirming readings to filter false triggers. This trades response speed for reliability.
+
+## False Positive Testing
+
+Two firmwares for automated false-positive measurement over 3-minute timed runs.
+
+### Test Procedure
+
+Each scenario runs for 3 minutes with nothing moving. The firmware auto-counts triggers and prints a summary.
+
+| Scenario | Setup | Expected Triggers |
+|----------|-------|-------------------|
+| A. Open air | No obstacle within 200 cm | 0 |
+| B. Wall at 80 cm | Sensor facing wall, 80 cm away | 1 (initial only) |
+| C. Furniture at 60 cm | Chair or table at 60 cm | 1 (initial only) |
+| D. Threshold edge ~100 cm | Obstacle right at threshold boundary | 0 or 1 |
+
+```bash
+# Flash a_fp_test_baseline.ino or a_fp_test_full.ino
+# Open Serial Monitor at 115200
+# Wait 3 minutes — do not touch anything
+# Copy the printed summary block
+```
+
+The full version additionally reports `rejectedByConsensus` — how many inside-threshold readings the consensus filter blocked.
+
+## Reproducing the Latency Tests
+
+### Prerequisites
 
 ```bash
 pip install pyserial
 ```
 
-Arduino IDE with ESP32 board support installed.
-
-## Step-by-Step Test Procedure
-
-### Step 1: Find your serial port
-
-Plug in the ESP32 via USB and run:
-
-```bash
-python -m serial.tools.list_ports
-```
-
-Note the port (e.g. `COM8` on Windows, `/dev/ttyUSB0` on Linux, `/dev/cu.usbserial-xxxx` on Mac).
-
-### Step 2: Collect baseline data
-
-1. Open `a_baseline_latency.ino` in Arduino IDE.
-2. Select your board and port under **Tools → Board** and **Tools → Port**.
-3. Click **Upload**.
-4. **Close the Serial Monitor** (Python and Serial Monitor cannot share the port).
-5. Run:
-
-```bash
-python latency_test.py --port COM8 --label baseline --samples 15
-```
-
-6. Place your hand far from the sensor (>100cm). Move it close (<100cm) to trigger. Move it away again until the serial output shows `inside=N`. Repeat 15 times. The script collects data automatically and saves to `latency_baseline.csv`.
-
-### Step 3: Collect full algorithm data
-
-1. Open `a_full_imu_latency.ino` in Arduino IDE.
-2. Upload.
-3. Close Serial Monitor.
-4. Run:
-
-```bash
-python latency_test.py --port COM8 --label full --samples 15
-```
-
-5. Same procedure: hand in, wait for trigger, hand out, wait for reset, repeat 15 times. Saves to `latency_full.csv`.
-
-### Step 4: Generate comparison
-
-```bash
-python latency_test.py --compare
-```
-
-Outputs a comparison table to the terminal and saves a markdown table to `latency_comparison.txt`.
-
-## Metrics Explained
-
-| Metric | What It Measures |
-|--------|-----------------|
-| `proc` (processing latency) | Time from echo received to GPIO pulled HIGH. Pure software execution time of `processReading()`. |
-| `e2e` (end-to-end latency) | Time from ultrasonic ping sent to GPIO pulled HIGH. Includes sound travel + processing. |
-| True perceived delay | Time from object entering range to alert firing. For baseline this equals `e2e`. For full version this equals `e2e + (STATE_CONFIRM_N - 1) × PING_INTERVAL_MS` because the algorithm waits for 3 consecutive confirming readings. |
-
-## Results
-
-Tested July 2026, 15 samples per version. Full analysis in [`ANALYSIS.md`](ANALYSIS.md).
-
-| Metric | Baseline | Full | Delta |
-|--------|----------|------|-------|
-| Proc latency (median) | 4 µs | 5 µs | +1 µs |
-| Proc latency (mean) | 3.7 µs | 5.4 µs | +1.7 µs |
-| E2E latency (median) | 5,932 µs | 7,516 µs | +1,584 µs |
-| E2E latency (mean) | 5,120 µs | 7,495 µs | +2,375 µs |
-| True perceived delay | ~46 ms | ~128 ms | +82 ms |
-| CPU usage per cycle | 0.009% | 0.014% | negligible |
-
-**Key findings:**
-
-1. **Algorithmic CPU cost is negligible.** Consensus + hysteresis + state confirmation + IMU variance together add only 1.7 µs.
-2. **E2E difference is physics, not software.** The full version triggers near the 100 cm threshold (~90 cm) while the baseline triggers at closer range (~49 cm). After normalizing for sound travel distance, software overhead is effectively zero.
-3. **The real cost is intentional delay.** `STATE_CONFIRM_N = 3` adds ~80 ms of deliberate waiting to filter false positives. This is a design tradeoff, not computational overhead.
-
-## Tips
-
-- Keep the test distance consistent across runs (e.g. always trigger at ~50cm) for fair comparison.
-- Wait for `inside=N` in the serial output before triggering the next sample.
-- If `dist=0` appears frequently, check your ultrasonic wiring.
-- If `var=0.0000` in the full version, check MPU6050 I2C wiring (SDA→40, SCL→41).
-- Replace `COM8` with your actual port in all commands.
-
-## Reproducing from Scratch
+### Step-by-step
 
 ```bash
 # Clone and switch branch
@@ -148,12 +151,34 @@ git checkout performance_testing_and_improvement
 # Install Python dependency
 pip install pyserial
 
-# Flash baseline via Arduino IDE, then:
-python latency_test.py --port COM8 --label baseline --samples 15
+# Find your serial port
+python -m serial.tools.list_ports
 
-# Flash full version via Arduino IDE, then:
+# --- Test 1: Baseline ---
+# Flash a_baseline_latency.ino via Arduino IDE
+# Close Serial Monitor, then:
+python latency_test.py --port COM8 --label baseline --samples 15
+# Move hand in (<100cm) and out (>100cm) 15 times
+
+# --- Test 2: Full (polling) ---
+# Flash a_full_imu_latency.ino via Arduino IDE
+# Close Serial Monitor, then:
 python latency_test.py --port COM8 --label full --samples 15
 
-# Compare
+# --- Test 3: Full (RTOS) ---
+# Flash a_step1_task_notification.ino via Arduino IDE
+# Close Serial Monitor, then:
+python latency_test.py --port COM8 --label rtos --samples 15
+
+# --- Compare baseline vs full ---
 python latency_test.py --compare
 ```
+
+Replace `COM8` with your actual serial port.
+
+### Tips
+- Keep trigger distance consistent across tests for fair comparison
+- Wait for `inside=N` before triggering the next sample
+- If `dist=0` appears frequently, check ultrasonic wiring
+- If `var=0.0000` in full version, check MPU6050 I2C wiring (SDA→40, SCL→41)
+- Close Arduino Serial Monitor before running the Python script
