@@ -23,6 +23,10 @@ performance_testing_and_improvement/
 ├── a_baseline_latency.ino      # Baseline firmware — threshold only, no algorithms
 ├── a_full_imu_latency.ino      # Full firmware — consensus, hysteresis, state confirm, IMU
 ├── latency_test.py             # Python serial data collector + stats + comparison
+├── latency_baseline.csv        # Collected baseline data (15 samples)
+├── latency_full.csv            # Collected full version data (15 samples)
+├── latency_comparison.txt      # Markdown comparison table
+├── ANALYSIS.md                 # Detailed results analysis and findings
 └── README.md
 ```
 
@@ -106,16 +110,24 @@ Outputs a comparison table to the terminal and saves a markdown table to `latenc
 | `e2e` (end-to-end latency) | Time from ultrasonic ping sent to GPIO pulled HIGH. Includes sound travel + processing. |
 | True perceived delay | Time from object entering range to alert firing. For baseline this equals `e2e`. For full version this equals `e2e + (STATE_CONFIRM_N - 1) × PING_INTERVAL_MS` because the algorithm waits for 3 consecutive confirming readings. |
 
-## Expected Results
+## Results
 
-| Metric | Baseline | Full | Why |
-|--------|----------|------|-----|
-| Processing latency | ~2–3 µs | ~5–20 µs | Full version runs consensus loop over 20-element history + IMU variance computation |
-| E2E (single cycle) | ~15 ms | ~15 ms | Dominated by speed of sound, not software |
-| True perceived delay | ~15 ms | ~95 ms | Full version requires 3 confirmations × 40ms ping interval |
-| False positives | Higher | Lower | Consensus + state confirmation filters noise |
+Tested July 2026, 15 samples per version. Full analysis in [`ANALYSIS.md`](ANALYSIS.md).
 
-The key tradeoff: the algorithms add negligible CPU cost but intentionally delay the decision by ~80ms to filter out false triggers.
+| Metric | Baseline | Full | Delta |
+|--------|----------|------|-------|
+| Proc latency (median) | 4 µs | 5 µs | +1 µs |
+| Proc latency (mean) | 3.7 µs | 5.4 µs | +1.7 µs |
+| E2E latency (median) | 5,932 µs | 7,516 µs | +1,584 µs |
+| E2E latency (mean) | 5,120 µs | 7,495 µs | +2,375 µs |
+| True perceived delay | ~46 ms | ~128 ms | +82 ms |
+| CPU usage per cycle | 0.009% | 0.014% | negligible |
+
+**Key findings:**
+
+1. **Algorithmic CPU cost is negligible.** Consensus + hysteresis + state confirmation + IMU variance together add only 1.7 µs.
+2. **E2E difference is physics, not software.** The full version triggers near the 100 cm threshold (~90 cm) while the baseline triggers at closer range (~49 cm). After normalizing for sound travel distance, software overhead is effectively zero.
+3. **The real cost is intentional delay.** `STATE_CONFIRM_N = 3` adds ~80 ms of deliberate waiting to filter false positives. This is a design tradeoff, not computational overhead.
 
 ## Tips
 
