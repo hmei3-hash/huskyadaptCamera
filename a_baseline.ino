@@ -1,32 +1,27 @@
 // ============================================================
-// BASELINE VERSION — Threshold Only (for performance testing)
+// BASELINE — Threshold Only (Latency Test)
 // ============================================================
-// Stripped: consensus, history buffer, hysteresis, state
-// confirmation, mode switching, button.
-// Purpose: measure raw latency, power, CPU as a reference
-// point to compare against the full algorithm.
+// Pins: TRIG=5, ECHO=4, LED/BUZZER=6
+// No algorithms. Pure threshold detection.
 // ============================================================
 
-#define TRIG_PIN        18
-#define ECHO_PIN        5
-#define TRIGGER_PIN     23
+#define TRIG_PIN        5
+#define ECHO_PIN        4
+#define TRIGGER_PIN     6
 
 #define MAX_DISTANCE_CM   400
 #define THRESHOLD_CM      100
-#define PULSE_MS          1000      // 1 second trigger pulse
+#define PULSE_MS          1000
 #define SOUND_SPEED_CM_US 0.0343f
 
-// === Timing ===
 #define PING_INTERVAL_MS  40
 #define ECHO_TIMEOUT_US   25000
 #define DEBUG_PRINT_MS    200
 
-// === ISR shared state ===
 volatile unsigned long echoStartUs = 0;
 volatile unsigned long echoEndUs = 0;
 volatile bool echoDone = false;
 
-// === Timing ===
 unsigned long lastPingMs = 0;
 unsigned long pingStartUs = 0;
 bool waitingForEcho = false;
@@ -37,20 +32,18 @@ bool pinIsHigh = false;
 unsigned long lastPrintMs = 0;
 unsigned long lastDist = 0;
 
-// === Inside/outside state (single variable) ===
 bool wasInside = false;
 
 void IRAM_ATTR echoISR() {
   if (digitalRead(ECHO_PIN) == HIGH) {
-    echoStartUs = micros();         // Rising edge: echo pulse started
+    echoStartUs = micros();
   } else {
-    echoEndUs = micros();           // Falling edge: echo pulse ended
+    echoEndUs = micros();
     echoDone = true;
   }
 }
 
 void triggerPing() {
-  // Send a 10us pulse on TRIG
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN, HIGH);
@@ -77,9 +70,10 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(ECHO_PIN), echoISR, CHANGE);
   lastPingMs = millis();
   Serial.println("Ready - BASELINE (threshold only)");
+  Serial.println("FORMAT: [LATENCY] dist=XXcm proc=XXus e2e=XXus");
 }
 
-void processReading(unsigned long dist) {
+void processReading(unsigned long dist, unsigned long echoReceivedUs) {
   lastDist = dist;
 
   if (dist == 0) return;
@@ -87,7 +81,21 @@ void processReading(unsigned long dist) {
   if (dist < THRESHOLD_CM) {
     if (!wasInside) {
       wasInside = true;
+
+      unsigned long beforeUs = micros();
       fireTrigger();
+      unsigned long afterUs = micros();
+
+      unsigned long procUs = afterUs - echoReceivedUs;
+      unsigned long e2eUs  = afterUs - pingStartUs;
+
+      Serial.print("[LATENCY] dist=");
+      Serial.print(dist);
+      Serial.print("cm proc=");
+      Serial.print(procUs);
+      Serial.print("us e2e=");
+      Serial.print(e2eUs);
+      Serial.println("us");
     }
   } else {
     wasInside = false;
@@ -97,34 +105,30 @@ void processReading(unsigned long dist) {
 void loop() {
   unsigned long now = millis();
 
-  // Task 1: kick off a new ping every PING_INTERVAL_MS
   if (!waitingForEcho && (now - lastPingMs >= PING_INTERVAL_MS)) {
     lastPingMs = now;
     triggerPing();
   }
 
-  // Task 2: handle finished echo
   if (waitingForEcho && echoDone) {
     waitingForEcho = false;
+    unsigned long echoReceivedUs = micros();
     unsigned long duration = echoEndUs - echoStartUs;
     unsigned long dist = (unsigned long)((duration * SOUND_SPEED_CM_US) / 2.0f);
-    if (dist < 2 || dist > MAX_DISTANCE_CM) dist = 0;   // mark invalid
-    processReading(dist);
+    if (dist < 2 || dist > MAX_DISTANCE_CM) dist = 0;
+    processReading(dist, echoReceivedUs);
   }
 
-  // Task 3: timeout check (no echo received)
   if (waitingForEcho && (micros() - pingStartUs > ECHO_TIMEOUT_US)) {
     waitingForEcho = false;
-    processReading(0);   // 0 = no reading
+    processReading(0, 0);
   }
 
-  // Task 4: non-blocking pulse drop
   if (pinIsHigh && (long)(now - triggerHighUntilMs) >= 0) {
     digitalWrite(TRIGGER_PIN, LOW);
     pinIsHigh = false;
   }
 
-  // Task 5: debug print
   if (now - lastPrintMs >= DEBUG_PRINT_MS) {
     lastPrintMs = now;
     Serial.print("[BASE] dist=");
