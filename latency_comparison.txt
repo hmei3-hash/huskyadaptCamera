@@ -1,0 +1,7 @@
+| Metric | Baseline | Full | Delta |
+|--------|----------|------|-------|
+| Proc median (us) | 4.0 | 5.0 | +1.0 |
+| Proc mean (us) | 3.7 | 5.4 | +1.7 |
+| E2E median (us) | 5932.0 | 7516.0 | +1584.0 |
+| E2E mean (us) | 5120.2 | 7494.6 | +2374.4 |
+| Samples | 15 | 15 | |
