@@ -1,155 +1,147 @@
-# HuskyAdapt Camera — Hybrid Depth Sensing System
+# Performance Testing & Improvement
 
-A hybrid proximity sensing system that combines **monocular depth estimation** (MiDaS), **object detection** (YOLOv8), and **ultrasonic sensing** to achieve reliable real-time depth perception on the Clearpath Husky platform.
+Branch: `performance_testing_and_improvement`
 
-## Architecture
+Latency and performance benchmarking for the HuskyAdapt proximity sensor. Compares a stripped-down baseline (threshold only) against the full IMU fusion algorithm (consensus + hysteresis + state confirmation + IMU auto mode switching) to quantify the cost of each algorithm layer.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                   Host PC (Python)                      │
-│                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │ YOLOv8 ONNX  │  │ MiDaS Depth  │  │  Ultrasonic  │  │
-│  │  Detection   │  │  Estimation  │  │  HTTP Client │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  │
-│         └────────┬────────┘                  │          │
-│           Combined Pipeline ◄────────────────┘          │
-└─────────────────────────────────────────────────────────┘
-                         │
-              BLE / WiFi │
-                         │
-┌─────────────────────────────────────────────────────────┐
-│                ESP32 Peripherals                        │
-│                                                         │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────────┐  │
-│  │ BLE Server 1│  │ BLE Server 2│  │  Ultrasonic    │  │
-│  │ Temperature │  │  Humidity   │  │  HTTP Server   │  │
-│  └─────────────┘  └─────────────┘  └────────────────┘  │
-│        └──────────────┬──────────────┘                  │
-│               BLE Client (Hub)                          │
-└─────────────────────────────────────────────────────────┘
-```
+## Hardware Setup
 
-## Project Structure
+| Component | GPIO | Notes |
+|-----------|------|-------|
+| HC-SR04 TRIG | 5 | Ultrasonic trigger |
+| HC-SR04 ECHO | 4 | Ultrasonic echo |
+| LED / Buzzer | 6 | Alert output (TRIGGER_PIN) |
+| MPU6050 SDA | 40 | I2C data (full version only) |
+| MPU6050 SCL | 41 | I2C clock (full version only) |
+
+Board: ESP32
+
+## Files
 
 ```
-huskyadaptCamera/
-├── vision/                         # Python computer vision
-│   ├── detection/
-│   │   ├── yolo_detect.py          # YOLOv8 real-time object detection
-│   │   └── export_model.py         # Export YOLOv8n .pt → .onnx
-│   ├── depth/
-│   │   ├── midas_depth.py          # MiDaS monocular depth estimation
-│   │   └── midas_grid.py           # Depth with 3×3 spatial grid overlay
-│   └── pipeline/
-│       └── combined_pipeline.py    # YOLO + MiDaS parallel pipeline
-│
-├── firmware/                       # ESP32 Arduino sketches
-│   ├── ble_client/                 # BLE hub — connects to both servers
-│   ├── ble_server_temp/            # BLE peripheral — temperature sensor
-│   ├── ble_server_humidity/        # BLE peripheral — humidity sensor
-│   └── ultrasonic_http/            # WiFi HTTP server + HC-SR04 sensor
-│
-├── models/                         # Model weights (git-ignored)
-├── docs/                           # Documentation & media
-├── requirements.txt
-├── .gitignore
+performance_testing_and_improvement/
+├── a_baseline_latency.ino      # Baseline firmware — threshold only, no algorithms
+├── a_full_imu_latency.ino      # Full firmware — consensus, hysteresis, state confirm, IMU
+├── latency_test.py             # Python serial data collector + stats + comparison
 └── README.md
 ```
 
-## Quick Start
+## What Each Firmware Does
 
-### 1. Python Environment
+**Baseline (`a_baseline_latency.ino`)**
+
+Simplest possible detection: if `distance < 100cm` and was previously outside, fire trigger immediately. No consensus, no history buffer, no hysteresis, no state confirmation, no IMU. One reading is enough to trigger.
+
+**Full (`a_full_imu_latency.ino`)**
+
+All algorithm layers enabled:
+- 20-reading history buffer with consensus filter (requires 2+ similar readings)
+- 10cm hysteresis band to prevent edge flickering
+- State confirmation requiring 3 consecutive readings before committing
+- MPU6050 accelerometer variance for automatic WALKING/QUEUING mode switching
+- Mode-dependent re-arm bands (110cm walking, 150cm queuing)
+
+Both firmwares print `[LATENCY]` lines on each trigger event with microsecond timestamps.
+
+## Prerequisites
 
 ```bash
-pip install -r requirements.txt
+pip install pyserial
 ```
 
-### 2. Export YOLOv8 Model
+Arduino IDE with ESP32 board support installed.
+
+## Step-by-Step Test Procedure
+
+### Step 1: Find your serial port
+
+Plug in the ESP32 via USB and run:
 
 ```bash
-cd vision/detection
-python export_model.py          # downloads yolov8n.pt → exports yolov8n.onnx
+python -m serial.tools.list_ports
 ```
 
-The ONNX file is saved to `models/` and is git-ignored.
+Note the port (e.g. `COM8` on Windows, `/dev/ttyUSB0` on Linux, `/dev/cu.usbserial-xxxx` on Mac).
 
-### 3. Run Individual Modules
+### Step 2: Collect baseline data
+
+1. Open `a_baseline_latency.ino` in Arduino IDE.
+2. Select your board and port under **Tools → Board** and **Tools → Port**.
+3. Click **Upload**.
+4. **Close the Serial Monitor** (Python and Serial Monitor cannot share the port).
+5. Run:
 
 ```bash
-# Object detection only
-python vision/detection/yolo_detect.py
-
-# Depth estimation only
-python vision/depth/midas_depth.py --ref-dist 0.5
-
-# Depth with 3×3 grid overlay
-python vision/depth/midas_grid.py --ref-dist 0.5
-
-# Combined YOLO + MiDaS pipeline (parallel, optimized)
-python vision/pipeline/combined_pipeline.py
+python latency_test.py --port COM8 --label baseline --samples 15
 ```
 
-### 4. Flash ESP32 Firmware
+6. Place your hand far from the sensor (>100cm). Move it close (<100cm) to trigger. Move it away again until the serial output shows `inside=N`. Repeat 15 times. The script collects data automatically and saves to `latency_baseline.csv`.
 
-Each folder under `firmware/` is a standalone Arduino sketch. Open in Arduino IDE or PlatformIO.
+### Step 3: Collect full algorithm data
 
-**Required library:** [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) (for BLE sketches)
+1. Open `a_full_imu_latency.ino` in Arduino IDE.
+2. Upload.
+3. Close Serial Monitor.
+4. Run:
 
-| Sketch | Board | Function |
-|--------|-------|----------|
-| `ble_server_temp/` | ESP32 | Advertises as "TempSensor_1", sends temperature via BLE NOTIFY |
-| `ble_server_humidity/` | ESP32 | Advertises as "HumSensor_2", sends humidity via BLE NOTIFY |
-| `ble_client/` | ESP32 | Connects to both BLE servers, aggregates sensor data |
-| `ultrasonic_http/` | ESP32 | HC-SR04 ultrasonic sensor + WiFi HTTP API at `/reading` |
+```bash
+python latency_test.py --port COM8 --label full --samples 15
+```
 
-## Combined Pipeline Features
+5. Same procedure: hand in, wait for trigger, hand out, wait for reset, repeat 15 times. Saves to `latency_full.csv`.
 
-The `combined_pipeline.py` is the main entry point with these optimizations:
+### Step 4: Generate comparison
 
-- **Parallel inference** — YOLO and MiDaS run concurrently via `ThreadPoolExecutor`
-- **Frame skipping** — configurable N-frame interval (press `+`/`-` at runtime)
-- **Vectorized YOLO parsing** — no Python for-loop over detections
-- **Reduced resolution** — YOLO@320, MiDaS@192 for speed
-- **FP16 on CUDA** — automatic half-precision when GPU is available
-- **Strided grid sampling** — skips pixels when computing cell averages
-- **Per-object depth** — each detected object shows estimated distance
+```bash
+python latency_test.py --compare
+```
 
-### Runtime Controls
+Outputs a comparison table to the terminal and saves a markdown table to `latency_comparison.txt`.
 
-| Key | Action |
-|-----|--------|
-| `Q` | Quit |
-| `+` / `-` | Increase / decrease frame skip |
-| Left-click | Print depth at clicked pixel |
+## Metrics Explained
 
-## Current Progress
+| Metric | What It Measures |
+|--------|-----------------|
+| `proc` (processing latency) | Time from echo received to GPIO pulled HIGH. Pure software execution time of `processReading()`. |
+| `e2e` (end-to-end latency) | Time from ultrasonic ping sent to GPIO pulled HIGH. Includes sound travel + processing. |
+| True perceived delay | Time from object entering range to alert firing. For baseline this equals `e2e`. For full version this equals `e2e + (STATE_CONFIRM_N - 1) × PING_INTERVAL_MS` because the algorithm waits for 3 consecutive confirming readings. |
 
-- [x] Monocular depth estimation (MiDaS)
-- [x] Real-time object detection (YOLOv8n ONNX)
-- [x] Combined parallel pipeline with per-object depth
-- [x] BLE sensor communication (temperature + humidity)
-- [x] Ultrasonic HTTP distance API
-- [x] 3×3 spatial depth grid with calibration
+## Expected Results
 
-## Future Work
+| Metric | Baseline | Full | Why |
+|--------|----------|------|-----|
+| Processing latency | ~2–3 µs | ~5–20 µs | Full version runs consensus loop over 20-element history + IMU variance computation |
+| E2E (single cycle) | ~15 ms | ~15 ms | Dominated by speed of sound, not software |
+| True perceived delay | ~15 ms | ~95 ms | Full version requires 3 confirmations × 40ms ping interval |
+| False positives | Higher | Lower | Consensus + state confirmation filters noise |
 
-- [ ] Integrate ultrasonic sensor into the combined pipeline for absolute reference
-- [ ] Sensor fusion (vision + ultrasonic) for improved depth accuracy
-- [ ] Point cloud generation from calibrated depth maps
-- [ ] ROS integration for Husky platform
+The key tradeoff: the algorithms add negligible CPU cost but intentionally delay the decision by ~80ms to filter out false triggers.
 
-## Hardware
+## Tips
 
-- **Compute:** PC/laptop with webcam (CUDA GPU recommended)
-- **Microcontrollers:** 3× ESP32 (BLE servers + client)
-- **Sensors:** HC-SR04 ultrasonic, DHT22/DS18B20 (temperature), SHT31 (humidity)
-- **Platform:** Clearpath Husky UGV
+- Keep the test distance consistent across runs (e.g. always trigger at ~50cm) for fair comparison.
+- Wait for `inside=N` in the serial output before triggering the next sample.
+- If `dist=0` appears frequently, check your ultrasonic wiring.
+- If `var=0.0000` in the full version, check MPU6050 I2C wiring (SDA→40, SCL→41).
+- Replace `COM8` with your actual port in all commands.
 
+## Reproducing from Scratch
 
+```bash
+# Clone and switch branch
+git clone https://github.com/hmei3-hash/huskyadaptProximitySensor.git
+cd huskyadaptProximitySensor
+git checkout performance_testing_and_improvement
 
-##todo
-加上时间窗口，长时间站着不动，然后就停止震动
-## License
+# Install Python dependency
+pip install pyserial
 
-MIT
+# Flash baseline via Arduino IDE, then:
+python latency_test.py --port COM8 --label baseline --samples 15
+
+# Flash full version via Arduino IDE, then:
+python latency_test.py --port COM8 --label full --samples 15
+
+# Compare
+python latency_test.py --compare
+```
